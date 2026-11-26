@@ -62,7 +62,9 @@ class Baker(Operator):
         # Bake settings{
         bake_settings = context.scene.render.bake
         self.default_use_s2a = bake_settings.use_selected_to_active
-        self.default_use_clear = bake_settings.use_clear
+        # 'use_clear' was removed in Blender 4.5 (baking no longer clears the
+        # target image automatically; the addon creates a fresh image anyway)
+        self.default_use_clear = getattr(bake_settings, 'use_clear', False)
         self.default_use_cage = bake_settings.use_cage
         self.default_cage_extrusion = bake_settings.cage_extrusion
         self.default_bake_margin    = bake_settings.margin
@@ -110,7 +112,8 @@ class Baker(Operator):
         # Bake settings{
         bake_settings = context.scene.render.bake
         bake_settings.use_selected_to_active = self.default_use_s2a
-        bake_settings.use_clear = self.default_use_clear
+        if hasattr(bake_settings, 'use_clear'):  # Removed in Blender 4.5+
+            bake_settings.use_clear = self.default_use_clear
         bake_settings.use_cage = self.default_use_cage
         bake_settings.cage_extrusion = self.default_cage_extrusion
         bake_settings.margin  = self.default_bake_margin
@@ -298,17 +301,23 @@ class Baker(Operator):
             group_exists = False
             ungroup_nodes = [n for n in nodes]
             for node in ungroup_nodes:
-                if node.type != 'GROUP':
+                # Only actual node groups have a 'node_tree' attribute;
+                # other node types are skipped. (In Blender 4.5/5.x the
+                # enum name of the group node type changed, so detect the
+                # group by its data instead of comparing node.type.)
+                if getattr(node, 'node_tree', None) is None:
                     continue
                 group_exists = True
-                
-                node_dict = {}
+
                 gr_nodes = node.node_tree.nodes
                 gr_in  = self.find_node(gr_nodes, 'GROUP_INPUT')
                 gr_out = self.find_node(gr_nodes, 'GROUP_OUTPUT')
-                if gr_in is None: continue
-                if gr_out is None: continue
-                
+                if gr_in is None or gr_out is None:
+                    # Nested widget/group setups we cannot flatten safely;
+                    # leave them untouched (baking through groups works).
+                    continue
+
+                node_dict = {}
                 for gr_node in gr_nodes:
                     if gr_node == gr_in:
                         continue
@@ -318,7 +327,10 @@ class Baker(Operator):
                         gr_node, gr_in, gr_out,
                         nodes, links, node, node_dict)
                 node_dict.clear()
-                nodes.remove(node)
+                try:
+                    nodes.remove(node)
+                except ReferenceError:
+                    pass
             if not group_exists:
                 break
             
@@ -370,9 +382,14 @@ class Baker(Operator):
         if m_type == 'AO':
             bake_type = 'AO'
         if m_type == 'Displacement':
-            bake_type = 'EMIT'
+            bake_type = 'DISPLACEMENT'
         if m_type == 'Shadow':
-            bake_type = 'SHADOW'
+            # 'SHADOW' bake type was removed in Blender 4.5,
+            # emulate it with the diffuse color pass instead
+            bake_type = 'DIFFUSE'
+            bake_settings.use_pass_direct   = False
+            bake_settings.use_pass_indirect = False
+            bake_settings.use_pass_color    = True
         if m_type == 'Normal':
             bake_type = 'NORMAL'
         if m_type == 'UV':
@@ -428,16 +445,27 @@ class Baker(Operator):
         map.final_aa = props.anti_alias
         if map.aa_override > 0:
             map.final_aa = map.aa_override
+        # Note: images.new() alpha is a float (premultiplied alpha flag) in
+        # Blender 2.9+, not a boolean like it was in 2.8x.
         bake_image = bpy.data.images.new(
             name = map.img_name.replace('*', name),
-            width  = map.target_width  * map.final_aa, 
-            height = map.target_height * map.final_aa
+            width  = map.target_width  * map.final_aa,
+            height = map.target_height * map.final_aa,
+            alpha  = True,
+            float_buffer = map.float_depth
         )
-        bake_image.use_generated_float = map.float_depth
+        try:
+            # 'use_generated_float' was removed in Blender 4.4;
+            # float depth is controlled by 'is_float' now (read-only).
+            bake_image.use_generated_float = map.float_depth
+        except AttributeError:
+            pass
         try:
             bake_image.colorspace_settings.name = map.color_space
         except:
             try:
+                # Older 4.x alpha builds renamed color spaces to
+                # 'sRGB EOTF' / 'Non-Colour Data'
                 if map.color_space == 'sRGB':
                     bake_image.colorspace_settings.name = 'sRGB EOTF'
                 elif map.color_space == 'Non-Color':
@@ -447,20 +475,16 @@ class Baker(Operator):
         
         context.scene.render.bake.margin = props.bake_margin * map.final_aa
         if props.save_or_pack == 'PACK':
-            bake_image.pack()
+            # Reserve the image for packing; the actual data is packed
+            # after baking completes (see SaveOrPackImage)
+            bake_image.filepath_raw = bake_image.name + ".png"
+            bake_image.file_format  = 'PNG'
         else:
-            extension = "."
-            if map.file_format == 'PNG':
-                extension = '.png'
-            if map.file_format == 'JPEG':
-                extension = '.jpg'
-            if map.file_format == 'OPEN_EXR':
-                extension = '.exr'
-            
             abs_save_path = bpy.path.abspath(props.save_path)
-            if not os.path.isdir(abs_save_path):
-                os.makedirs(abs_save_path, 0o777)
-            
+            if not abs_save_path:
+                abs_save_path = os.path.expanduser("~")
+            extension = self.image_extension(map)
+
             if props.create_folder:
                 if props.bake_mode == "ALL_TO_ONE":
                     bake_image.filepath = abspath(join(abs_save_path, props.folder_name, bake_image.name + extension))
@@ -468,8 +492,12 @@ class Baker(Operator):
                     bake_image.filepath = abspath(join(abs_save_path, name, bake_image.name + extension))
             else:
                 bake_image.filepath = abspath(join(abs_save_path, bake_image.name + extension))
-            
-            bake_image.save_render(bake_image.filepath)
+
+            # Make sure the target directory exists before baking starts;
+            # (the actual file is written after baking in SaveOrPackImage)
+            directory = os.path.dirname(bpy.path.abspath(bake_image.filepath))
+            if directory and not os.path.isdir(directory):
+                os.makedirs(directory, exist_ok=True)
         
         return bake_image
     
@@ -511,10 +539,17 @@ class Baker(Operator):
     
     def RestoreMaterials(self):
         for i in range(0, min(len(self.object_slots), len(self.original_materials))):
-            if self.object_slots[i] is not None:
-                if self.object_slots[i].material is not None:
-                    bpy.data.materials.remove(self.object_slots[i].material)
-                self.object_slots[i].material = self.original_materials[i]
+            slot = self.object_slots[i]
+            # The object (and therefore its slots) may have been deleted
+            # since reservation; accessing a removed struct raises
+            # ReferenceError and could crash Blender 4.x here.
+            try:
+                if slot is not None:
+                    if slot.material is not None:
+                        bpy.data.materials.remove(slot.material)
+                    slot.material = self.original_materials[i]
+            except ReferenceError:
+                pass
         self.object_slots.clear()
         self.original_materials.clear()
     
@@ -609,6 +644,61 @@ class Baker(Operator):
         if map.final_aa == 1:
             return
         img.scale(map.target_width, map.target_height)
+
+    def SaveOrPackImage(self, context, bake_image, map):
+        # NOTE: 'bake_image.save_render()' must NOT be used here: it performs a
+        # full render-write through the scene's render pipeline (and reads back
+        # via IMB_ibufFromMemory), which on Blender 4.x/5.x is extremely slow
+        # (pins one CPU core for many minutes per texture) and could even crash
+        # depending on the file format settings. 'Image.save()' writes the
+        # buffer directly using the image file settings - this is what we want.
+        props = context.scene.BakeLabProps
+        if props.save_or_pack == 'PACK':
+            # Pack into the .blend file without writing to disk first
+            bake_image.pack(method='MEM')
+            return
+
+        # Ensure a valid file path (also fixes empty paths left over from
+        # older saved setups, which caused crashes on save in Blender 4.x)
+        filepath = bpy.path.abspath(bake_image.filepath) if bake_image.filepath else ''
+        if not filepath:
+            abs_save_path = bpy.path.abspath(props.save_path) or os.path.expanduser('~')
+            extension = self.image_extension(map)
+            name = bake_image.name
+            if props.create_folder:
+                if props.bake_mode == "ALL_TO_ONE":
+                    filepath = abspath(join(abs_save_path, props.folder_name, name + extension))
+                else:
+                    filepath = abspath(join(abs_save_path, name, name + extension))
+            else:
+                filepath = abspath(join(abs_save_path, name + extension))
+            bake_image.filepath = filepath
+            filepath = bpy.path.abspath(bake_image.filepath)
+
+        directory = os.path.dirname(filepath)
+        if directory and not os.path.isdir(directory):
+            os.makedirs(directory, exist_ok=True)
+
+        # Write the image file using the image's own format settings
+        bake_image.file_format = map.file_format
+        try:
+            bake_image.save()
+        except Exception as e:
+            # Fall back to the legacy render-pipeline writer if direct
+            # saving fails for some reason
+            self.report(type = {'WARNING'},
+                        message = "Direct image save failed (%s), falling back to save_render" % str(e))
+            self.SetSaveImageSettings(context, map)
+            bake_image.save_render(filepath)
+
+    def image_extension(self, map):
+        if map.file_format == 'PNG':
+            return '.png'
+        if map.file_format == 'JPEG':
+            return '.jpg'
+        if map.file_format == 'OPEN_EXR':
+            return '.exr'
+        return '.png'
     
     def UpdateDisplayStatus(self, props, obj, map, image):
         props.baking_obj_name = obj.name
@@ -621,6 +711,32 @@ class Baker(Operator):
         if map.final_aa != 1:
             props.baking_map_size += str(' (' + str(map.final_aa)+'X)')
     
+    def is_baking(self):
+        # Check whether Cycles still has an active bake job running.
+        # 'bpy.app.is_job_running' returns None for unknown job types on
+        # older Blender versions, so compare explicitly. Also check the
+        # progress of any running 'Baking' job as a fallback.
+        if bpy.app.is_job_running('BLENDER_RENDER') is True or \
+           bpy.app.is_job_running('CYCLES') is True:
+            return True
+        for job in bpy.context.window_manager.jobs:
+            if 'Baking' in job.status or 'Baking' in job.name:
+                return True
+        return False
+
+    def wait_for_bake(self, bake_image):
+        # Wait until the current bake finishes.
+        # NOTE: polling 'bake_image.is_dirty' alone is unreliable on
+        # Blender 4.x/5.x (the flag may be reset by image updates or never
+        # set when saving/packing re-uploads the buffer), which previously
+        # caused the addon to hang or save stale images.
+        while bpy.ops.object.bake_check('INVOKE_DEFAULT') != {'FINISHED'}:
+            yield 1
+        while self.is_baking():
+            yield 1
+        # Give the main thread one more tick to finalize the result buffer
+        yield 1
+
     def Bake(self, context):
         yield 1
         scene = context.scene
@@ -692,16 +808,12 @@ class Baker(Operator):
                     # Bake {
                     while bpy.ops.object.bake('INVOKE_DEFAULT', type = bake_type) != {'RUNNING_MODAL'}:
                         yield 1
-                    while not bake_image.is_dirty:
-                        yield 1
+                    yield from self.wait_for_bake(bake_image)
                     # }
 
                     self.down_scale(bake_image, props, map)
-                    if props.save_or_pack == 'PACK':
-                        bake_image.pack()
-                    else:
-                        bake_image.save_render(bake_image.filepath)
-                    
+                    self.SaveOrPackImage(context, bake_image, map)
+
                     baked_data.AddMap(map, bake_image) # Save baking data
                     self.RestoreMaterials()
         ##########################################################################################
@@ -749,17 +861,13 @@ class Baker(Operator):
                     # Bake {
                     while bpy.ops.object.bake('INVOKE_DEFAULT', type = bake_type) != {'RUNNING_MODAL'}:
                         yield 1
-                    while not bake_image.is_dirty:
-                        yield 1
+                    yield from self.wait_for_bake(bake_image)
                     # }
 
                     self.RestoreMaterials()
 
                     self.down_scale(bake_image, props, map)
-                    if props.save_or_pack == 'PACK':
-                        bake_image.pack()
-                    else:
-                        bake_image.save_render(bake_image.filepath)
+                    self.SaveOrPackImage(context, bake_image, map)
                 else:
                     render.bake.use_clear = False
                     bake_image = self.PrepareImage(context, map, selected_objects, props.global_image_name)
@@ -775,22 +883,18 @@ class Baker(Operator):
                         # Bake {
                         while bpy.ops.object.bake('INVOKE_DEFAULT', type = bake_type) != {'RUNNING_MODAL'}:
                             yield 1
-                        while not bake_image.is_dirty:
-                            yield 1
+                        yield from self.wait_for_bake(bake_image)
                         # }
                         
-                        if props.save_or_pack == 'PACK':
-                            bake_image.pack()
-                        else:
-                            bake_image.save_render(bake_image.filepath)
-                        
+                        # Intermediate save after each object so that
+                        # progress isn't lost; final save happens after
+                        # down-scaling below.
+                        self.SaveOrPackImage(context, bake_image, map)
+
                         self.RestoreMaterials()
 
                     self.down_scale(bake_image, props, map)
-                    if props.save_or_pack == 'PACK':
-                        bake_image.pack()
-                    else:
-                        bake_image.save_render(bake_image.filepath)
+                    self.SaveOrPackImage(context, bake_image, map)
                     
                 baked_data.AddMap(map, bake_image) # Save baking data
 
@@ -847,16 +951,12 @@ class Baker(Operator):
                 # Bake {
                 while bpy.ops.object.bake('INVOKE_DEFAULT', type = bake_type) != {'RUNNING_MODAL'}:
                     yield 1
-                while not bake_image.is_dirty:
-                    yield 1
+                yield from self.wait_for_bake(bake_image)
                 # }
 
                 self.down_scale(bake_image, props, map)
-                if props.save_or_pack == 'PACK':
-                    bake_image.pack()
-                else:
-                    bake_image.save_render(bake_image.filepath)
-                
+                self.SaveOrPackImage(context, bake_image, map)
+
                 baked_data.AddMap(map, bake_image) # Save baking data
                 self.RestoreMaterials()
         ##########################################################################################
@@ -897,6 +997,6 @@ class Baker(Operator):
     def execute(self, context):
         self.BakeCrt = self.Bake(context)
         wm = context.window_manager
-        self._timer = wm.event_timer_add(0.5, window=context.window)
+        self._timer = wm.event_timer_add(0.1, window=context.window)
         wm.modal_handler_add(self)
         return {'RUNNING_MODAL'}
