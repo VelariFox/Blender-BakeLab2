@@ -174,6 +174,16 @@ class BakeLabProperties(PropertyGroup):
                 subtype="DIR_PATH",
                 update=updateSavePath
             )
+    # NOTE: 'use_saved_data' was removed in Blender 5.0 (it forced baking to
+    # run on CPU even when a GPU device was selected, which made writes very
+    # slow). The replacement is the per-device threads limit below.
+    gpu_threads : IntProperty(
+        name = 'GPU Render Threads',
+        description = 'CPU thread limit used for GPU rendering (0 = auto). '
+                      'Lower it if baking with GPU maxes out the CPU',
+        default = 0,
+        min = 0, soft_max = 64
+    )
     show_bake_settings : BoolProperty(name = '', default = False)
     show_map_settings  : BoolProperty(name = '', default = False)
     show_file_settings : BoolProperty(name = '', default = False)

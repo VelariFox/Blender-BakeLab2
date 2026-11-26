@@ -1,6 +1,10 @@
 from bpy.types import (
+            Operator,
             Panel
         )
+import bpy
+import os
+from bpy.props import StringProperty
 
 class BakeLabUI(Panel):
     bl_label = "BakeLab"
@@ -70,11 +74,17 @@ class BakeLabUI(Panel):
             layout.prop(props, "anti_alias")
             layout.prop(props, "save_or_pack", expand=True)
             layout.use_property_split = False
-            if props.save_or_pack == "SAVE":
-                layout.prop(props, "save_path")
-                layout.prop(props, "create_folder")
+            if props.save_or_pack == 'SAVE':
+                # Use the native file selector instead of relying only on a
+                # path text field: pasted paths with backslashes could end up
+                # invalid/relative, and saving to them crashed Blender 4.x.
+                col = layout.column(align=True)
+                col.operator("bakelab.browse_save_path",
+                             icon='FILE_FOLDER', text="Browse...")
+                col.prop(props, "save_path", text="Folder")
+                col.prop(props, "create_folder")
                 if props.bake_mode == "ALL_TO_ONE":
-                    layout.prop(props, "folder_name")
+                    col.prop(props, "folder_name")
             else:
                 layout.label(text = "")
             col = layout.column()
@@ -278,3 +288,33 @@ class BakeLabUI(Panel):
                 layout.operator("bakelab.apply_displace", icon='RNDCURVE')
                 layout.separator()
                 layout.operator("bakelab.finish")
+
+
+import bpy
+from bpy.types import Operator
+
+
+class BakeLab_BrowseSavePath(Operator):
+    """Select the folder where baked images will be saved"""
+    bl_idname = "bakelab.browse_save_path"
+    bl_label = "Browse Save Folder"
+
+    filepath: StringProperty(subtype='DIR_PATH')
+
+    def invoke(self, context, event):
+        wm = context.window_manager
+        props = context.scene.BakeLabProps
+        self.filepath = bpy.path.abspath(props.save_path) or ""
+        wm.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+        props = context.scene.BakeLabProps
+        if self.filepath:
+            # Normalize and store as an absolute path so that relative
+            # backslash paths (which crashed saving in Blender 4.x) never
+            # reach the image save code.
+            props.save_path = os.path.abspath(self.filepath)
+        return {'FINISHED'}
+
+
